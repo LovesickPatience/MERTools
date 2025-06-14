@@ -8,7 +8,7 @@ class MultiheadAttention(nn.Module):
     See "Attention Is All You Need" for more details.
     """
 
-    def __init__(self, embed_dim, num_heads, attn_dropout=0.,
+    def __init__(self, embed_dim, num_heads, query_dim, kv_dim, attn_dropout=0.,
                  bias=True, add_bias_kv=False, add_zero_attn=False):
         super().__init__()
         self.embed_dim = embed_dim
@@ -22,7 +22,14 @@ class MultiheadAttention(nn.Module):
         self.register_parameter('in_proj_bias', None)
         if bias:
             self.in_proj_bias = Parameter(torch.Tensor(3 * embed_dim))
+            self.q_proj_bias = Parameter(torch.Tensor(embed_dim))
+            self.k_proj_bias = Parameter(torch.Tensor(embed_dim))
+            self.v_proj_bias = Parameter(torch.Tensor(embed_dim))
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        self.q_proj_weight = Parameter(torch.Tensor(embed_dim, query_dim))
+        self.k_proj_weight = Parameter(torch.Tensor(embed_dim, kv_dim))
+        self.v_proj_weight = Parameter(torch.Tensor(embed_dim, kv_dim))
 
         if add_bias_kv:
             self.bias_k = Parameter(torch.Tensor(1, 1, embed_dim))
@@ -37,9 +44,18 @@ class MultiheadAttention(nn.Module):
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.in_proj_weight)
         nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.xavier_uniform_(self.q_proj_weight)
+        nn.init.xavier_uniform_(self.k_proj_weight)
+        nn.init.xavier_uniform_(self.v_proj_weight)
         if self.in_proj_bias is not None:
             nn.init.constant_(self.in_proj_bias, 0.)
             nn.init.constant_(self.out_proj.bias, 0.)
+        if self.q_proj_bias is not None:
+            nn.init.constant_(self.q_proj_bias, 0.)
+        if self.k_proj_bias is not None:
+            nn.init.constant_(self.k_proj_bias, 0.)
+        if self.v_proj_bias is not None:
+            nn.init.constant_(self.v_proj_bias, 0.)
         if self.bias_k is not None:
             nn.init.xavier_normal_(self.bias_k)
         if self.bias_v is not None:
@@ -54,32 +70,42 @@ class MultiheadAttention(nn.Module):
         batch x src_len, where padding elements are indicated by 1s.
         """
         qkv_same = query.data_ptr() == key.data_ptr() == value.data_ptr()
+        same_input_size = (query.size(-1) == key.size(-1) == value.size(-1) == self.embed_dim)
+
         kv_same = key.data_ptr() == value.data_ptr()
 
         tgt_len, bsz, embed_dim = query.size()
-        assert embed_dim == self.embed_dim
-        assert list(query.size()) == [tgt_len, bsz, embed_dim]
+        if same_input_size:
+            assert embed_dim == self.embed_dim
+            assert list(query.size()) == [tgt_len, bsz, embed_dim]
         assert key.size() == value.size()
+        assert self.embed_dim == self.num_heads * self.head_dim
 
         aved_state = None
 
-        if qkv_same:
-            # self-attention
-            q, k, v = self.in_proj_qkv(query)
-        elif kv_same:
-            # encoder-decoder attention
-            q = self.in_proj_q(query)
+        if same_input_size:
+            if qkv_same:
+                # self-attention
+                q, k, v = self.in_proj_qkv(query)
+            elif kv_same:
+                # encoder-decoder attention
+                q = self.in_proj_q(query)
 
-            if key is None:
-                assert value is None
-                k = v = None
+                if key is None:
+                    assert value is None
+                    k = v = None
+                else:
+                    k, v = self.in_proj_kv(key)
             else:
-                k, v = self.in_proj_kv(key)
+                q = self.in_proj_q(query)
+                k = self.in_proj_k(key)
+                v = self.in_proj_v(value)
+            q = q * self.scaling
         else:
-            q = self.in_proj_q(query)
-            k = self.in_proj_k(key)
-            v = self.in_proj_v(value)
-        q = q * self.scaling
+            q = F.linear(query, self.q_proj_weight, self.q_proj_bias)
+            k = F.linear(key, self.k_proj_weight, self.k_proj_bias)
+            v = F.linear(value, self.v_proj_weight, self.v_proj_bias)
+            q = q * self.scaling
 
         if self.bias_k is not None:
             assert self.bias_v is not None
@@ -122,7 +148,7 @@ class MultiheadAttention(nn.Module):
         attn = torch.bmm(attn_weights, v)
         assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
 
-        attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
+        attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, self.num_heads * self.head_dim)
         attn = self.out_proj(attn)
 
         # average attention weights over heads

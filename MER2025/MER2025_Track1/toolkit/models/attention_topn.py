@@ -97,26 +97,46 @@ class Attention_TOPN_Discriminator(nn.Module):
         super().__init__()
 
         self.args = args
-
-        self.encoder_text = MLPEncoder(args.text_dim, args.text_dim, args.dropout)
-        self.encoder_audio = MLPEncoder(args.audio_dim, args.text_dim, args.dropout)
-        self.encoder_video = MLPEncoder(args.video_dim, args.text_dim, args.dropout)
+        if args.video_dim == args.audio_dim == args.text_dim:
+            self.encoder_audio = nn.Identity()
+            self.encoder_video = nn.Identity()
+            self.encoder_text = nn.Identity()
+        else:
+            self.encoder_text = nn.Identity()
+            if args.audio_dim != args.text_dim:
+                if 'misa' in args.model:
+                    self.encoder_audio = nn.Sequential(
+                        nn.Linear(args.audio_dim, args.text_dim),
+                        nn.ReLU(),
+                        nn.Dropout(args.dropout)
+                    )
+                else:
+                    self.encoder_audio = nn.Identity()
+                self.encoder_video = nn.Identity()
+            if args.video_dim != args.text_dim:
+                if 'misa' in args.model:
+                    self.encoder_video = nn.Sequential(
+                        nn.LayerNorm(args.video_dim),
+                        nn.Linear(args.video_dim, args.text_dim),
+                        nn.ReLU(),
+                        nn.Dropout(args.dropout)
+                    )
+                else:
+                    self.encoder_video = nn.Identity()
+                self.encoder_audio = nn.Identity()
         input_dims = args.text_dim
 
-        self.attention_mlp = MLPEncoder(input_dims * 3, args.hidden_dim, args.dropout)
+        if 'topn_lf_dnn' in args.model:
+            self.attention_mlp = MLPEncoder(args.video_dim + args.audio_dim + args.text_dim, args.hidden_dim, args.dropout)
+        else:
+            self.attention_mlp = MLPEncoder(input_dims * 3, args.hidden_dim, args.dropout)
         self.fc_att = nn.Linear(args.hidden_dim, 3)
 
     def forward(self, feat_text, feat_audio, feat_video):
         # x: (B, D) for each modality
-        if self.args.audio_dim == self.args.text_dim == self.args.video_dim:
-            h_text = feat_text
-            h_audio = feat_audio
-            h_video = feat_video
-        else:
-            # 若三个输入特征长度不相同时
-            h_text = self.encoder_text(feat_text)
-            h_audio = self.encoder_audio(feat_audio)
-            h_video = self.encoder_video(feat_video)
+        h_text = self.encoder_text(feat_text)
+        h_audio = self.encoder_audio(feat_audio)
+        h_video = self.encoder_video(feat_video)
 
         # 拼接后用于 attention 权重预测
         concat_hidden = torch.cat([h_text, h_audio, h_video], dim=-1)  # (B, 3*hidden_dim)
